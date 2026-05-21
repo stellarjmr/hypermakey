@@ -1,0 +1,10 @@
+[package]
+name = "hypermakey"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal macOS Caps Lock to Hyper Key background utility"
+license = "MIT"
+repository = "https://github.com/stellarjmr/hypermakey"
+
+[dependencies]
+signal-hook = "0.3"
