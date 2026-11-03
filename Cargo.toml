@@ -8,3 +8,12 @@ repository = "https://github.com/stellarjmr/hypermakey"
 
 [dependencies]
 signal-hook = "0.3"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+# Keep the default panic = "unwind": both FFI callbacks rely on catch_unwind.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

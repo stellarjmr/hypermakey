@@ -1,12 +1,12 @@
+use crate::logging::log_message;
 use crate::state::{HyperAction, HyperState};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::error::Error as StdError;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::fmt;
-use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
@@ -47,12 +47,21 @@ const EVENT_TAP_OPTION_DEFAULT: CGEventTapOptions = 0;
 const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const CF_NUMBER_SINT32_TYPE: CFNumberType = 3;
 
+// Device matching keys: kIOHIDDeviceUsagePageKey and kIOHIDDeviceUsageKey.
 const HID_DEVICE_USAGE_PAGE_KEY: &CStr = c"DeviceUsagePage";
 const HID_DEVICE_USAGE_KEY: &CStr = c"DeviceUsage";
-const HID_USAGE_PAGE_GENERIC_DESKTOP: i32 = 0x01;
-const HID_USAGE_KEYBOARD: i32 = 0x06;
+// Input value (element) matching keys: kIOHIDElementUsagePageKey and kIOHIDElementUsageKey.
+const HID_ELEMENT_USAGE_PAGE_KEY: &CStr = c"UsagePage";
+const HID_ELEMENT_USAGE_KEY: &CStr = c"Usage";
+const HID_USAGE_PAGE_GENERIC_DESKTOP: u32 = 0x01;
+const HID_USAGE_KEYBOARD: u32 = 0x06;
 
 const IORETURN_SUCCESS: IOReturn = 0;
+// kIOReturnNotPrivileged and kIOReturnNotPermitted: iokit_common_err(0x2c1) and (0x2e2).
+const IORETURN_NOT_PRIVILEGED: IOReturn = 0xE000_02C1_u32 as IOReturn;
+const IORETURN_NOT_PERMITTED: IOReturn = 0xE000_02E2_u32 as IOReturn;
+
+const QOS_CLASS_USER_INTERACTIVE: QosClass = 0x21;
 
 const MODIFIERS: [Modifier; 4] = [
     Modifier {
@@ -89,36 +98,77 @@ impl fmt::Display for MacosError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RunLoopUnavailable => write!(formatter, "failed to get the current CFRunLoop"),
-            Self::EventTapCreateFailed => write!(
-                formatter,
-                "failed to create a keyboard event tap. Grant Accessibility permission to hypermakey or the launching terminal, then restart it"
-            ),
+            Self::EventTapCreateFailed => {
+                write!(formatter, "failed to create a keyboard event tap. ")?;
+                write_permission_hint(formatter, "Accessibility")
+            }
             Self::EventTapSourceCreateFailed => {
                 write!(formatter, "failed to attach the event tap to the run loop")
             }
             Self::HidManagerCreateFailed => write!(formatter, "failed to create IOHIDManager"),
             Self::HidMatchingCreateFailed => {
-                write!(formatter, "failed to create IOHID keyboard matching dictionary")
+                write!(formatter, "failed to create IOHID matching dictionaries")
+            }
+            Self::HidManagerOpenFailed(
+                code @ (IORETURN_NOT_PERMITTED | IORETURN_NOT_PRIVILEGED),
+            ) => {
+                write!(
+                    formatter,
+                    "not permitted to read keyboard input (IOReturn {:#010x}). ",
+                    *code as u32
+                )?;
+                write_permission_hint(formatter, "Input Monitoring")
             }
             Self::HidManagerOpenFailed(code) => {
-                write!(formatter, "failed to open IOHIDManager: IOReturn {code}")
+                write!(
+                    formatter,
+                    "failed to open IOHIDManager: IOReturn {:#010x}",
+                    *code as u32
+                )
             }
-            Self::SignalInstall(error) => write!(formatter, "failed to install signal handlers: {error}"),
-            Self::SignalThread(error) => write!(formatter, "failed to start signal thread: {error}"),
+            Self::SignalInstall(error) => {
+                write!(formatter, "failed to install signal handlers: {error}")
+            }
+            Self::SignalThread(error) => {
+                write!(formatter, "failed to start signal thread: {error}")
+            }
         }
     }
 }
 
 impl StdError for MacosError {}
 
+/// Names the permission and the binary to grant it to, and warns against granting it to a
+/// terminal, which would extend it to every program started from that terminal.
+fn write_permission_hint(formatter: &mut fmt::Formatter<'_>, permission: &str) -> fmt::Result {
+    let executable = std::env::current_exe().map_or_else(
+        |_| "hypermakey".to_owned(),
+        |path| path.display().to_string(),
+    );
+
+    write!(
+        formatter,
+        "Grant {permission} permission to {executable} in System Settings → Privacy & Security → \
+         {permission}, then restart hypermakey. Run it as a service (brew services) rather than \
+         from a terminal: started from a terminal, macOS checks the terminal app instead, and \
+         granting the terminal extends the permission to every program run from it."
+    )
+}
+
 pub fn run() -> Result<(), MacosError> {
+    raise_thread_qos();
+
+    // SAFETY: CFRunLoopGetCurrent has no preconditions. The returned run loop belongs to this
+    // thread and lives until the process exits.
     let run_loop = unsafe { cf_run_loop_get_current() };
     if run_loop.is_null() {
         return Err(MacosError::RunLoopUnavailable);
     }
 
-    let mut context = Box::new(AppContext::new());
-    let context_ptr = context.as_mut() as *mut AppContext as *mut c_void;
+    let context = Box::new(AppContext::new());
+    // Both callbacks only read through this pointer (AppContext uses interior mutability), and
+    // `context` outlives the event tap and the HID manager created below.
+    let context_ptr = ptr::from_ref(&*context).cast_mut().cast::<c_void>();
 
     let event_tap = EventTap::create(run_loop, context_ptr)?;
     context.set_event_tap(event_tap.port());
@@ -131,25 +181,33 @@ pub fn run() -> Result<(), MacosError> {
         env!("CARGO_PKG_VERSION")
     ));
 
+    // SAFETY: runs this thread's run loop until the signal thread stops it.
     unsafe {
         cf_run_loop_run();
     }
 
-    context.release_hyper_if_active();
-    log_message(format_args!("hypermakey stopped."));
-
+    // Stop intercepting input before releasing Hyper: the release events are posted at the HID
+    // level and would otherwise be routed through this tap, which nothing services any more.
     drop(hid_manager);
     context.clear_event_tap();
     drop(event_tap);
-    drop(context);
+    context.release_hyper_if_active();
+    log_message(format_args!("hypermakey stopped."));
 
     Ok(())
 }
 
-fn log_message(arguments: fmt::Arguments<'_>) {
-    let mut stderr = io::stderr().lock();
-    let _ = stderr.write_fmt(arguments);
-    let _ = stderr.write_all(b"\n");
+/// Every keystroke in the system waits for this thread's event tap callback, so it should not
+/// be scheduled like background work. launchd still caps the effective priority unless the job's
+/// ProcessType is Interactive.
+fn raise_thread_qos() {
+    // SAFETY: only changes the scheduling class of the calling thread.
+    let result = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    if result != 0 {
+        log_message(format_args!(
+            "hypermakey: could not raise the run loop thread to user-interactive QoS (error {result})."
+        ));
+    }
 }
 
 fn install_signal_handlers(run_loop: CFRunLoopRef) -> Result<(), MacosError> {
@@ -164,6 +222,8 @@ fn install_signal_handlers(run_loop: CFRunLoopRef) -> Result<(), MacosError> {
                     "hypermakey: received signal {signal}, stopping."
                 ));
                 let run_loop = run_loop_address as CFRunLoopRef;
+                // SAFETY: CFRunLoopStop and CFRunLoopWakeUp may be called from any thread, and
+                // the main thread's run loop exists until the process exits.
                 unsafe {
                     cf_run_loop_stop(run_loop);
                     cf_run_loop_wake_up(run_loop);
@@ -220,6 +280,7 @@ impl AppContext {
             return;
         }
 
+        // SAFETY: the pointer is the tap's port, which `run` clears before dropping the tap.
         unsafe {
             cg_event_tap_enable(event_tap, true);
         }
@@ -270,6 +331,8 @@ impl EventTap {
         let event_mask =
             event_mask(EVENT_KEY_DOWN) | event_mask(EVENT_KEY_UP) | event_mask(EVENT_FLAGS_CHANGED);
 
+        // SAFETY: the callback has the CGEventTapCallBack signature, and `context` points to an
+        // AppContext that outlives the tap (see `run`).
         let port = unsafe {
             cg_event_tap_create(
                 EVENT_TAP_LOCATION_HID,
@@ -285,14 +348,19 @@ impl EventTap {
             return Err(MacosError::EventTapCreateFailed);
         }
 
+        // SAFETY: `port` is the valid mach port created above; a null allocator selects the
+        // default allocator.
         let source = unsafe { cf_mach_port_create_run_loop_source(ptr::null(), port, 0) };
         if source.is_null() {
+            // SAFETY: we own the only reference to `port`; invalidating it removes the tap.
             unsafe {
+                cf_mach_port_invalidate(port);
                 cf_release(port as CFTypeRef);
             }
             return Err(MacosError::EventTapSourceCreateFailed);
         }
 
+        // SAFETY: `run_loop` is this thread's run loop, and `source` and `port` are valid.
         unsafe {
             cf_run_loop_add_source(run_loop, source, K_CF_RUN_LOOP_COMMON_MODES);
             cg_event_tap_enable(port, true);
@@ -312,9 +380,14 @@ impl EventTap {
 
 impl Drop for EventTap {
     fn drop(&mut self) {
+        // SAFETY: `port` and `source` are the objects created in `create` and attached to
+        // `run_loop`; each reference we own is released exactly once here. Invalidating the port
+        // destroys its receive right, so the tap is gone even if CoreGraphics still holds a
+        // reference to the CFMachPort.
         unsafe {
             cg_event_tap_enable(self.port, false);
             cf_run_loop_remove_source(self.run_loop, self.source, K_CF_RUN_LOOP_COMMON_MODES);
+            cf_mach_port_invalidate(self.port);
             cf_release(self.source as CFTypeRef);
             cf_release(self.port as CFTypeRef);
         }
@@ -328,21 +401,35 @@ struct HidManager {
 
 impl HidManager {
     fn create(run_loop: CFRunLoopRef, context: *mut c_void) -> Result<Self, MacosError> {
+        let device_matching = create_usage_matching(
+            HID_DEVICE_USAGE_PAGE_KEY,
+            HID_USAGE_PAGE_GENERIC_DESKTOP,
+            HID_DEVICE_USAGE_KEY,
+            HID_USAGE_KEYBOARD,
+        )
+        .ok_or(MacosError::HidMatchingCreateFailed)?;
+        // Without input value matching, IOKit delivers every key of every keyboard to this
+        // process, although only Caps Lock is needed.
+        let value_matching = create_usage_matching(
+            HID_ELEMENT_USAGE_PAGE_KEY,
+            CAPS_LOCK_HID_USAGE_PAGE,
+            HID_ELEMENT_USAGE_KEY,
+            CAPS_LOCK_HID_USAGE,
+        )
+        .ok_or(MacosError::HidMatchingCreateFailed)?;
+
+        // SAFETY: a null allocator selects the default allocator; 0 is kIOHIDOptionsTypeNone.
         let manager = unsafe { io_hid_manager_create(ptr::null(), 0) };
         if manager.is_null() {
             return Err(MacosError::HidManagerCreateFailed);
         }
 
-        let matching = create_keyboard_matching_dictionary().ok_or_else(|| {
-            unsafe {
-                cf_release(manager as CFTypeRef);
-            }
-            MacosError::HidMatchingCreateFailed
-        })?;
-
+        // SAFETY: `manager` is valid, and both dictionaries are valid CFDictionaries that the
+        // manager keeps its own references to. The callback has the IOHIDValueCallback
+        // signature, and `context` points to an AppContext that outlives the manager (see `run`).
         unsafe {
-            io_hid_manager_set_device_matching(manager, matching);
-            cf_release(matching as CFTypeRef);
+            io_hid_manager_set_device_matching(manager, device_matching.as_ptr());
+            io_hid_manager_set_input_value_matching(manager, value_matching.as_ptr());
             io_hid_manager_register_input_value_callback(
                 manager,
                 Some(hid_input_value_callback),
@@ -351,8 +438,10 @@ impl HidManager {
             io_hid_manager_schedule_with_run_loop(manager, run_loop, K_CF_RUN_LOOP_COMMON_MODES);
         }
 
+        // SAFETY: `manager` is valid; 0 is kIOHIDOptionsTypeNone (no exclusive device access).
         let result = unsafe { io_hid_manager_open(manager, 0) };
         if result != IORETURN_SUCCESS {
+            // SAFETY: undoes the scheduling above and releases our only reference to `manager`.
             unsafe {
                 io_hid_manager_unschedule_from_run_loop(
                     manager,
@@ -370,6 +459,8 @@ impl HidManager {
 
 impl Drop for HidManager {
     fn drop(&mut self) {
+        // SAFETY: `manager` was scheduled on `run_loop` and opened in `create`; each step is
+        // undone once here before our only reference is released.
         unsafe {
             io_hid_manager_unschedule_from_run_loop(
                 self.manager,
@@ -414,6 +505,8 @@ fn event_tap_callback_inner(
         return event;
     }
 
+    // SAFETY: `context` is the AppContext registered in `run`, which outlives the event tap,
+    // and AppContext is only ever accessed through shared references.
     let app = unsafe { &*(context as *const AppContext) };
 
     match event_type {
@@ -435,7 +528,7 @@ fn event_tap_callback_inner(
     if matches!(
         event_type,
         EVENT_KEY_DOWN | EVENT_KEY_UP | EVENT_FLAGS_CHANGED
-    ) && event_keycode(event) == KEY_CAPS_LOCK
+    ) && event_keycode(event) == i64::from(KEY_CAPS_LOCK)
     {
         return ptr::null_mut();
     }
@@ -477,33 +570,48 @@ fn hid_input_value_callback_inner(context: *mut c_void, result: IOReturn, value:
         return;
     }
 
+    // SAFETY: `value` is the non-null IOHIDValue passed to this callback.
     let element = unsafe { io_hid_value_get_element(value) };
     if element.is_null() {
         return;
     }
 
-    let usage_page = unsafe { io_hid_element_get_usage_page(element) };
-    let usage = unsafe { io_hid_element_get_usage(element) };
+    // SAFETY: `element` is the non-null element of `value`.
+    let (usage_page, usage) = unsafe {
+        (
+            io_hid_element_get_usage_page(element),
+            io_hid_element_get_usage(element),
+        )
+    };
 
+    // Input value matching already limits callbacks to Caps Lock; this check is a guard.
     if usage_page == CAPS_LOCK_HID_USAGE_PAGE && usage == CAPS_LOCK_HID_USAGE {
+        // SAFETY: `value` is the non-null IOHIDValue passed to this callback.
         let pressed = unsafe { io_hid_value_get_integer_value(value) } != 0;
+        // SAFETY: `context` is the AppContext registered in `run`, which outlives the HID
+        // manager, and AppContext is only ever accessed through shared references.
         let app = unsafe { &*(context as *const AppContext) };
         app.handle_caps_value(pressed);
     }
 }
 
 fn is_synthetic_event(event: CGEventRef) -> bool {
-    (unsafe { cg_event_get_integer_value_field(event, EVENT_FIELD_EVENT_SOURCE_USER_DATA) })
-        == SYNTHETIC_EVENT_MARKER
+    // SAFETY: `event` is the non-null CGEvent passed to the tap callback.
+    let user_data =
+        unsafe { cg_event_get_integer_value_field(event, EVENT_FIELD_EVENT_SOURCE_USER_DATA) };
+    user_data == SYNTHETIC_EVENT_MARKER
 }
 
-fn event_keycode(event: CGEventRef) -> u16 {
-    unsafe { cg_event_get_integer_value_field(event, EVENT_FIELD_KEYBOARD_EVENT_KEYCODE) as u16 }
+/// Returns the keycode field unnarrowed, so that no out-of-range value can alias a real key.
+fn event_keycode(event: CGEventRef) -> i64 {
+    // SAFETY: `event` is the non-null CGEvent passed to the tap callback.
+    unsafe { cg_event_get_integer_value_field(event, EVENT_FIELD_KEYBOARD_EVENT_KEYCODE) }
 }
 
 fn add_hyper_flags(event: CGEventRef) {
-    let flags = unsafe { cg_event_get_flags(event) };
+    // SAFETY: `event` is the non-null CGEvent passed to the tap callback, which may modify it.
     unsafe {
+        let flags = cg_event_get_flags(event);
         cg_event_set_flags(event, flags | HYPER_FLAGS);
     }
 }
@@ -527,6 +635,7 @@ fn post_hyper_up() {
 }
 
 fn post_modifier_event(keycode: u16, key_down: bool, flags: CGEventFlags) {
+    // SAFETY: a null source selects the default event source; the result is a new event we own.
     let event = unsafe { cg_event_create_keyboard_event(ptr::null_mut(), keycode, key_down) };
     if event.is_null() {
         log_message(format_args!(
@@ -535,6 +644,8 @@ fn post_modifier_event(keycode: u16, key_down: bool, flags: CGEventFlags) {
         return;
     }
 
+    // SAFETY: `event` is the valid event created above. CGEventPost does not take ownership, so
+    // our reference is released after posting.
     unsafe {
         cg_event_set_flags(event, flags);
         cg_event_set_integer_value_field(
@@ -547,65 +658,90 @@ fn post_modifier_event(keycode: u16, key_down: bool, flags: CGEventFlags) {
     }
 }
 
-fn create_keyboard_matching_dictionary() -> Option<CFMutableDictionaryRef> {
+/// An owned (+1) reference to a CoreFoundation object, released on drop.
+struct CfOwned(NonNull<c_void>);
+
+impl CfOwned {
+    /// Takes ownership of the reference returned by a CoreFoundation `Create` function.
+    ///
+    /// # Safety
+    ///
+    /// `object` must be null or a CoreFoundation object whose reference the caller owns.
+    unsafe fn from_create(object: *const c_void) -> Option<Self> {
+        NonNull::new(object.cast_mut()).map(Self)
+    }
+
+    fn as_ptr(&self) -> *mut c_void {
+        self.0.as_ptr()
+    }
+}
+
+impl Drop for CfOwned {
+    fn drop(&mut self) {
+        // SAFETY: `self` owns exactly one reference to a live CoreFoundation object.
+        unsafe {
+            cf_release(self.as_ptr());
+        }
+    }
+}
+
+/// Builds `{page_key: page, usage_key: usage}`, the shape of both IOHID device matching and
+/// input value (element) matching dictionaries.
+fn create_usage_matching(
+    page_key: &CStr,
+    page: u32,
+    usage_key: &CStr,
+    usage: u32,
+) -> Option<CfOwned> {
+    // SAFETY: the callbacks are CoreFoundation's own kCFType callbacks, and the result is a new
+    // dictionary that we own.
     let dictionary = unsafe {
-        cf_dictionary_create_mutable(
+        CfOwned::from_create(cf_dictionary_create_mutable(
             ptr::null(),
             0,
             &K_CF_TYPE_DICTIONARY_KEY_CALLBACKS,
             &K_CF_TYPE_DICTIONARY_VALUE_CALLBACKS,
-        )
-    };
-    if dictionary.is_null() {
-        return None;
-    }
+        ))
+    }?;
 
-    let usage_page_key = create_cf_string(HID_DEVICE_USAGE_PAGE_KEY)?;
-    let usage_key = create_cf_string(HID_DEVICE_USAGE_KEY)?;
-    let usage_page = create_cf_i32(HID_USAGE_PAGE_GENERIC_DESKTOP)?;
-    let usage = create_cf_i32(HID_USAGE_KEYBOARD)?;
-
-    unsafe {
-        cf_dictionary_set_value(
-            dictionary,
-            usage_page_key as CFTypeRef,
-            usage_page as CFTypeRef,
-        );
-        cf_dictionary_set_value(dictionary, usage_key as CFTypeRef, usage as CFTypeRef);
-        cf_release(usage_page_key as CFTypeRef);
-        cf_release(usage_key as CFTypeRef);
-        cf_release(usage_page as CFTypeRef);
-        cf_release(usage as CFTypeRef);
+    let entries = [
+        (create_cf_string(page_key)?, create_cf_number(page)?),
+        (create_cf_string(usage_key)?, create_cf_number(usage)?),
+    ];
+    for (key, value) in &entries {
+        // SAFETY: all three objects are valid. The dictionary retains the key and the value
+        // (kCFType callbacks), so our own references can be released afterwards.
+        unsafe {
+            cf_dictionary_set_value(dictionary.as_ptr(), key.as_ptr(), value.as_ptr());
+        }
     }
 
     Some(dictionary)
 }
 
-fn create_cf_string(value: &CStr) -> Option<CFStringRef> {
-    let string = unsafe {
-        cf_string_create_with_c_string(ptr::null(), value.as_ptr(), CF_STRING_ENCODING_UTF8)
-    };
-
-    if string.is_null() {
-        None
-    } else {
-        Some(string)
+fn create_cf_string(value: &CStr) -> Option<CfOwned> {
+    // SAFETY: `value` is a NUL-terminated ASCII (hence UTF-8) string; the result is a new string
+    // that we own.
+    unsafe {
+        CfOwned::from_create(cf_string_create_with_c_string(
+            ptr::null(),
+            value.as_ptr(),
+            CF_STRING_ENCODING_UTF8,
+        ))
     }
 }
 
-fn create_cf_i32(value: i32) -> Option<CFNumberRef> {
-    let number = unsafe {
-        cf_number_create(
+fn create_cf_number(value: u32) -> Option<CfOwned> {
+    let value = i32::try_from(value).ok()?;
+
+    // SAFETY: `value` is a live i32, matching kCFNumberSInt32Type; the result is a new number
+    // that we own.
+    unsafe {
+        CfOwned::from_create(cf_number_create(
             ptr::null(),
             CF_NUMBER_SINT32_TYPE,
-            &value as *const i32 as *const c_void,
-        )
-    };
-
-    if number.is_null() {
-        None
-    } else {
-        Some(number)
+            ptr::from_ref(&value).cast(),
+        ))
     }
 }
 
@@ -646,6 +782,7 @@ type IOHIDManagerRef = *mut c_void;
 type IOHIDValueRef = *mut c_void;
 type IOHIDElementRef = *mut c_void;
 type IOHIDValueCallback = extern "C" fn(*mut c_void, IOReturn, *mut c_void, IOHIDValueRef);
+type QosClass = u32;
 
 #[repr(C)]
 struct CFDictionaryKeyCallBacks {
@@ -712,6 +849,9 @@ extern "C" {
         port: CFMachPortRef,
         order: CFIndex,
     ) -> CFRunLoopSourceRef;
+
+    #[link_name = "CFMachPortInvalidate"]
+    fn cf_mach_port_invalidate(port: CFMachPortRef);
 
     #[link_name = "CFStringCreateWithCString"]
     fn cf_string_create_with_c_string(
@@ -789,6 +929,9 @@ extern "C" {
     #[link_name = "IOHIDManagerSetDeviceMatching"]
     fn io_hid_manager_set_device_matching(manager: IOHIDManagerRef, matching: CFDictionaryRef);
 
+    #[link_name = "IOHIDManagerSetInputValueMatching"]
+    fn io_hid_manager_set_input_value_matching(manager: IOHIDManagerRef, matching: CFDictionaryRef);
+
     #[link_name = "IOHIDManagerRegisterInputValueCallback"]
     fn io_hid_manager_register_input_value_callback(
         manager: IOHIDManagerRef,
@@ -827,4 +970,112 @@ extern "C" {
 
     #[link_name = "IOHIDValueGetIntegerValue"]
     fn io_hid_value_get_integer_value(value: IOHIDValueRef) -> CFIndex;
+}
+
+// libSystem is linked by default.
+extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: QosClass, relative_priority: c_int) -> c_int;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CoreFoundation's `Boolean` is `unsigned char`, unlike the C99 `bool` taken by CoreGraphics.
+    type CFBoolean = u8;
+
+    extern "C" {
+        #[link_name = "CFDictionaryGetCount"]
+        fn cf_dictionary_get_count(dictionary: CFDictionaryRef) -> CFIndex;
+
+        #[link_name = "CFDictionaryGetValue"]
+        fn cf_dictionary_get_value(dictionary: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
+
+        #[link_name = "CFNumberGetValue"]
+        fn cf_number_get_value(
+            number: CFNumberRef,
+            number_type: CFNumberType,
+            value_ptr: *mut c_void,
+        ) -> CFBoolean;
+    }
+
+    fn entry_count(dictionary: &CfOwned) -> CFIndex {
+        // SAFETY: `dictionary` is a valid CFDictionary.
+        unsafe { cf_dictionary_get_count(dictionary.as_ptr()) }
+    }
+
+    fn entry_i32(dictionary: &CfOwned, key: &CStr) -> Option<i32> {
+        let key = create_cf_string(key)?;
+        // SAFETY: both objects are valid; the returned value is borrowed from the dictionary.
+        let number = unsafe { cf_dictionary_get_value(dictionary.as_ptr(), key.as_ptr()) };
+        if number.is_null() {
+            return None;
+        }
+
+        let mut value = 0_i32;
+        // SAFETY: `number` is a CFNumber owned by the dictionary, which is still alive, and
+        // `value` is writable storage for kCFNumberSInt32Type.
+        let converted = unsafe {
+            cf_number_get_value(
+                number,
+                CF_NUMBER_SINT32_TYPE,
+                ptr::from_mut(&mut value).cast(),
+            )
+        };
+        (converted != 0).then_some(value)
+    }
+
+    #[test]
+    fn caps_lock_value_matching_selects_only_the_caps_lock_element() {
+        let matching = create_usage_matching(
+            HID_ELEMENT_USAGE_PAGE_KEY,
+            CAPS_LOCK_HID_USAGE_PAGE,
+            HID_ELEMENT_USAGE_KEY,
+            CAPS_LOCK_HID_USAGE,
+        )
+        .expect("value matching dictionary");
+
+        assert_eq!(entry_count(&matching), 2);
+        assert_eq!(entry_i32(&matching, c"UsagePage"), Some(0x07));
+        assert_eq!(entry_i32(&matching, c"Usage"), Some(0x39));
+    }
+
+    #[test]
+    fn keyboard_device_matching_uses_device_keys() {
+        let matching = create_usage_matching(
+            HID_DEVICE_USAGE_PAGE_KEY,
+            HID_USAGE_PAGE_GENERIC_DESKTOP,
+            HID_DEVICE_USAGE_KEY,
+            HID_USAGE_KEYBOARD,
+        )
+        .expect("device matching dictionary");
+
+        assert_eq!(entry_count(&matching), 2);
+        assert_eq!(entry_i32(&matching, c"DeviceUsagePage"), Some(0x01));
+        assert_eq!(entry_i32(&matching, c"DeviceUsage"), Some(0x06));
+    }
+
+    #[test]
+    fn cf_numbers_reject_values_outside_sint32() {
+        assert!(create_cf_number(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn permission_errors_name_the_permission_and_ask_for_a_restart() {
+        let tap = MacosError::EventTapCreateFailed.to_string();
+        assert!(tap.contains("Grant Accessibility permission to "));
+        assert!(tap.contains("then restart hypermakey"));
+
+        let hid = MacosError::HidManagerOpenFailed(IORETURN_NOT_PERMITTED).to_string();
+        assert!(hid.contains("IOReturn 0xe00002e2"));
+        assert!(hid.contains("Grant Input Monitoring permission to "));
+    }
+
+    #[test]
+    fn other_hid_open_errors_show_the_raw_code() {
+        assert_eq!(
+            MacosError::HidManagerOpenFailed(-1).to_string(),
+            "failed to open IOHIDManager: IOReturn 0xffffffff"
+        );
+    }
 }
