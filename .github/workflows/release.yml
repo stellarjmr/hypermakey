@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build, attest, and publish
+    runs-on: macos-latest
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # OIDC token used to sign the attestation
+      attestations: write # store the attestation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          rustup default stable
+
+      - name: Test
+        run: cargo test --locked
+
+      # Fails unless the tag equals v<version from Cargo.toml>.
+      - name: Build, sign, and package
+        run: scripts/package-release.sh "${GITHUB_REF_NAME}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/hypermakey-*.tar.gz
+            target/aarch64-apple-darwin/release/hypermakey
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
+          {
+            echo "### Homebrew formula"
+            echo
+            echo "Point \`url\` at the new archive and set \`sha256\` to the first field below:"
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

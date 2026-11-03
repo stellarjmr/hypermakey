@@ -1,3 +1,4 @@
+mod logging;
 mod state;
 
 #[cfg(target_os = "macos")]
@@ -7,7 +8,7 @@ use std::error::Error;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("hypermakey: {error}");
+        logging::log_message(format_args!("hypermakey: {error}"));
         std::process::exit(1);
     }
 }
