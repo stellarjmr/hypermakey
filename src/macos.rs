@@ -92,12 +92,20 @@ pub enum MacosError {
     HidManagerOpenFailed(IOReturn),
     SignalInstall(std::io::Error),
     SignalThread(std::io::Error),
+    AccessibilityRevoked,
 }
 
 impl fmt::Display for MacosError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RunLoopUnavailable => write!(formatter, "failed to get the current CFRunLoop"),
+            Self::AccessibilityRevoked => {
+                write!(
+                    formatter,
+                    "Accessibility permission was revoked while hypermakey was running. "
+                )?;
+                write_permission_hint(formatter, "Accessibility")
+            }
             Self::EventTapCreateFailed => {
                 write!(formatter, "failed to create a keyboard event tap. ")?;
                 write_permission_hint(formatter, "Accessibility")
@@ -194,6 +202,11 @@ pub fn run() -> Result<(), MacosError> {
     context.release_hyper_if_active();
     log_message(format_args!("hypermakey stopped."));
 
+    if context.is_permission_revoked() {
+        // Exit with an error so that launchd starts hypermakey again, which then reports the
+        // missing permission until it is granted.
+        return Err(MacosError::AccessibilityRevoked);
+    }
     Ok(())
 }
 
@@ -208,6 +221,12 @@ fn raise_thread_qos() {
             "hypermakey: could not raise the run loop thread to user-interactive QoS (error {result})."
         ));
     }
+}
+
+/// Whether this process currently holds Accessibility permission.
+fn is_accessibility_trusted() -> bool {
+    // SAFETY: AXIsProcessTrusted has no preconditions and never prompts the user.
+    unsafe { ax_is_process_trusted() != 0 }
 }
 
 fn install_signal_handlers(run_loop: CFRunLoopRef) -> Result<(), MacosError> {
@@ -238,6 +257,7 @@ struct AppContext {
     state: Mutex<HyperState>,
     hyper_active: AtomicBool,
     event_tap: AtomicPtr<c_void>,
+    permission_revoked: AtomicBool,
 }
 
 impl AppContext {
@@ -246,7 +266,12 @@ impl AppContext {
             state: Mutex::new(HyperState::new()),
             hyper_active: AtomicBool::new(false),
             event_tap: AtomicPtr::new(ptr::null_mut()),
+            permission_revoked: AtomicBool::new(false),
         }
+    }
+
+    fn is_permission_revoked(&self) -> bool {
+        self.permission_revoked.load(Ordering::Acquire)
     }
 
     fn set_event_tap(&self, event_tap: CFMachPortRef) {
@@ -271,6 +296,20 @@ impl AppContext {
 
     fn recover_disabled_tap(&self, reason: &str) {
         self.release_hyper_if_active();
+
+        // After Accessibility is revoked, a re-enabled tap makes every keystroke in the system
+        // wait for it to time out again. Stop instead of re-enabling it.
+        if !is_accessibility_trusted() {
+            self.permission_revoked.store(true, Ordering::Release);
+            log_message(format_args!(
+                "hypermakey: event tap was disabled ({reason}) and Accessibility permission was revoked; stopping."
+            ));
+            // SAFETY: tap callbacks run on the thread that owns this run loop.
+            unsafe {
+                cf_run_loop_stop(cf_run_loop_get_current());
+            }
+            return;
+        }
 
         let event_tap = self.event_tap.load(Ordering::Acquire);
         if event_tap.is_null() {
@@ -751,7 +790,10 @@ struct Modifier {
     flag: CGEventFlags,
 }
 
+/// C99 `bool`, as taken by the CoreGraphics event functions.
 type Boolean = bool;
+/// MacTypes `Boolean` (`unsigned char`), as returned by CoreFoundation and HIServices.
+type CFBoolean = u8;
 type CFIndex = isize;
 type CFAllocatorRef = *const c_void;
 type CFTypeRef = *const c_void;
@@ -885,6 +927,9 @@ extern "C" {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    #[link_name = "AXIsProcessTrusted"]
+    fn ax_is_process_trusted() -> CFBoolean;
+
     #[link_name = "CGEventTapCreate"]
     fn cg_event_tap_create(
         tap: CGEventTapLocation,
@@ -981,9 +1026,6 @@ extern "C" {
 mod tests {
     use super::*;
 
-    /// CoreFoundation's `Boolean` is `unsigned char`, unlike the C99 `bool` taken by CoreGraphics.
-    type CFBoolean = u8;
-
     extern "C" {
         #[link_name = "CFDictionaryGetCount"]
         fn cf_dictionary_get_count(dictionary: CFDictionaryRef) -> CFIndex;
@@ -1069,6 +1111,11 @@ mod tests {
         let hid = MacosError::HidManagerOpenFailed(IORETURN_NOT_PERMITTED).to_string();
         assert!(hid.contains("IOReturn 0xe00002e2"));
         assert!(hid.contains("Grant Input Monitoring permission to "));
+
+        let revoked = MacosError::AccessibilityRevoked.to_string();
+        assert!(revoked.starts_with("Accessibility permission was revoked while hypermakey"));
+        assert!(revoked.contains("Grant Accessibility permission to "));
+        assert!(revoked.contains("then restart hypermakey"));
     }
 
     #[test]
