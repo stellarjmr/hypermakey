@@ -15,6 +15,7 @@ It is designed to be minimal:
 - Release Caps Lock to release Hyper.
 - Suppress the original Caps Lock event so it should not toggle caps state.
 - Release synthesized modifiers during shutdown and event tap recovery to avoid stuck keys.
+- Stop instead of re-enabling the event tap if Accessibility permission was revoked while running, so keyboard input is not stalled again and again.
 - Read only the Caps Lock element from keyboard HID devices; other key values are never delivered to hypermakey through the HID path.
 - Prefix log lines with the local time and UTC offset.
 
@@ -45,7 +46,9 @@ For the Homebrew service, the executable path is typically:
 
 After changing permissions, restart `hypermakey`.
 
-Release binaries are signed ad hoc, so macOS treats every new version as a different program: grant the permission again after each upgrade.
+After an upgrade, macOS may deny the permission to the new binary. hypermakey then logs the missing permission, and macOS lists hypermakey in the Accessibility pane switched off: switch it back on.
+
+Do not remove hypermakey from the list or switch it off while it is running. Stop the service first (`brew services stop stellarjmr/tool/hypermakey`): an event tap whose permission is revoked stalls keyboard input until macOS times it out.
 
 ## Homebrew service
 
